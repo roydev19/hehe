@@ -6,7 +6,7 @@ from flask import Flask, jsonify, abort
 MANIFEST = {
     "id": "roydev.stremio.googledrive",
     "version": "1.0.6",
-    "name": "GDrive",
+    "name": "DNS_testing",
     "description": "If you know, you know.",
     "logo": "https://github.com/roydev19/hehe/raw/main/cover.jpg",
     "resources": ["stream"],

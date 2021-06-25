@@ -4,6 +4,7 @@ import PTN
 import json
 import requests
 from datetime import datetime
+from string import punctuation
 from googleapiclient.discovery import build
 from google.oauth2.credentials import Credentials
 
@@ -43,19 +44,56 @@ class meta:
         return self.formatted
 
 
-class cinemeta:
+class MetadataNotFound(Exception):
+    pass
+
+
+class meta_provider:
     def __init__(self, type, id):
+        self.id = id
+        self.type = type
+        self.cm_url = 'v3-cinemeta.strem.io'
+        self.imdbsg_url = 'v2.sg.media-imdb.com'
+        self.fix_char = lambda x: x.replace("'", "\\'").replace(":", "").lower()
+        self.re_punc = lambda x: x.translate(str.maketrans('', '', punctuation))
+
+        meta = None
         id_split = id.split(':')
-        url = f"https://v3-cinemeta.strem.io/meta/{type}/{id_split[0]}.json"
-        results = requests.get(url).json().get('meta')
 
-        self.name = results['name'].replace("'", "\\'")
-        self.slug = ' '.join(results['slug'].split('/')[-1].split('-')[0:-1])
-        self.year = results['year'].split('–')[0]
+        if self.type == 'series':
+            self.id = id_split[0]
+            self.ep = str(id_split[-1]).zfill(2)
+            self.se = str(id_split[-2]).zfill(2)
 
-        self.se = f"{int(id_split[1]):02d}" if type == 'series' else None
-        self.ep = f"{int(id_split[2]):02d}" if type == 'series' else None
+        meta = self.get(self.imdbsg_url, 'd')
+        if meta:
+            self.set_meta(self.id, meta[0], year='y', name='l')
+        else:  # fallback to cinemeta just for keks
+            meta = self.get(self.cm_url)
+            if meta:
+                self.set_meta(self.id, meta)
 
+        if meta:
+            self.slug = self.re_punc(self.name)
+            self.names = [self.name,
+                          self.slug] if self.name != self.slug else [self.slug]
+        else:
+            raise MetadataNotFound(f"Couldn't find metadata for {id}!")
+
+    def get(self, url, keyname='meta'):
+        url += f"/meta/{self.type}/{self.id}.json" if not url.startswith(
+                "v2.sg.media-imdb") else f"/suggests/t/{self.id}.json"
+        try:
+            r = requests.get(f'https://{url}', timeout=5).text
+            # imbd wont return proper json sometimes so:
+            return json.loads(r[r.index('{'):].rstrip(')')).get(keyname)
+        except requests.exceptions.Timeout:
+            print(f"ERROR: FAILED TO FETCH META ({id})!")
+            return None
+
+    def set_meta(self, id, meta, year='year', name='name'):
+        self.year = str(meta.get(year)).split('–')[0]
+        self.name = self.fix_char(meta.get(name))
 
 class gdrive:
     def __init__(self):
@@ -71,8 +109,8 @@ class gdrive:
         self.drive_instance = build('drive', 'v3', credentials=creds)
 
     def get_query(self, type, id):
-        def qgen(
-            string, chain='or', method='fullText', splitter=', ', quotes=False):
+        def qgen(string, chain='or', method='fullText', 
+                 splitter=', ', quotes=False):
             out = ''
             for word in string.split(splitter):
                 if out:
@@ -83,28 +121,26 @@ class gdrive:
                     out += f"{method} contains '{word}'"
             return out
 
-        cm = cinemeta(type, id)
-
-        names = [cm.slug]
-        if cm.slug != cm.name.casefold():
-            names.append(cm.name)
+        mp = meta_provider(type, id)
+        self.mp = mp  # need this for se_ep check later
 
         if type == 'series':
             return ['(' + \
-                    qgen('^|%$'.join(names), splitter='^|%$', quotes=True) + \
+                    qgen('^%$'.join(mp.names), splitter='^%$', quotes=True) + \
                     ") and (" + qgen(
-                    f's{cm.se} e{cm.ep}, ' + \
-                    f's{int(cm.se)} e{int(cm.ep)}, ' + \
-                    f'season {int(cm.se)} episode {int(cm.ep)}, ' + \
-                    f'"{int(cm.se)} x {int(cm.ep)}", ' + \
-                    f'"{int(cm.se)} x {cm.ep}"') + ')']
+                    f's{mp.se} e{mp.ep}, ' + \
+                    f's{int(mp.se)} e{int(mp.ep)}, ' + \
+                    f'season {int(mp.se)} episode {int(mp.ep)}, ' + \
+                    f'"{int(mp.se)} x {int(mp.ep)}", ' + \
+                    f'"{int(mp.se)} x {mp.ep}"') + ')']
+
         elif type == 'movie':
             def query(name):
                 return "name contains '" + \
-                        f"*{name} {cm.year}".replace(" ", "*") + "' or (" + \
-                        qgen(f"{name} {cm.year}", chain='and', method='name',
+                        f"*{name} {mp.year}".replace(" ", "*") + "' or (" + \
+                        qgen(f"{name} {mp.year}", chain='and', method='name',
                             splitter=' ') + ")"
-            return [query(name) for name in names]
+            return [query(name) for name in mp.names]
 
     def file_list(self, file_fields):
         out = []
@@ -141,9 +177,6 @@ class gdrive:
         return self.drive_names
 
     def search(self, query):
-        def get_size(dic):
-            return int(dic.get('size'))
-
         self.query = query
         self.results = []
 
@@ -155,22 +188,26 @@ class gdrive:
             for obj in response:
                 unique_id = f"{obj.get('md5Checksum')}__{obj.get('driveId')}"
                 if not unique_ids.get(unique_id):
-                    obj.pop('md5Checksum')
+                    try:
+                        obj.pop('md5Checksum')
+                    except KeyError:
+                        print(f"WARN, Checksum not found: {obj}")
                     unique_ids[unique_id] = True
                     self.results.append(obj)
 
             self.get_drive_names()
-            self.results.sort(key=get_size, reverse=True)
+            self.results.sort(
+                key=(lambda dic: int(dic.get('size'))), reverse=True)
 
         return self.results
 
     def correct_se_ep(self, id, obj):
         id = id.split(':')[1:]
-        seep = re.compile(r"(?ix)(\d+)[^a-zA-Z]*?(?:ep|e|x|episode)[^a-zA-Z]*?(\d+)")
-
+        seep = re.compile(
+            r"(?ix)(\d+)[^a-zA-Z]*?(?:ep|e|x|episode)[^a-zA-Z]*?(\d+)")
         try:
             se, ep = seep.findall(obj['name'])[0]
-            if int(se) == int(id[0]) and int(ep) == int(id[1]):
+            if int(se) == int(self.mp.se) and int(self.mp.ep) == int(id[1]):
                 return True
         except (ValueError, IndexError):
             return False
@@ -178,11 +215,12 @@ class gdrive:
 
     def get_streams(self, type, id):
         def get_name():
-            return m.get_string(f'Test \n;%quality \n;%resolution')
+            return m.get_string(f'dEV Testing \n;%quality \n;%resolution')
 
         def get_title():
             m.get_string('🎥;%codec 🌈;%bitDepth;bit 🔊;%audio 👤;%encoder')
-            return f"{name}\n💾 {gib_size:.3f} GiB ☁️ {drive_name}\n{m.formatted}"
+            return f"{name}\n💾 {gib_size:.3f} GiB ☁️ " \
+                   f"{drive_name}\n{m.formatted}"
 
         def get_url():
             return f"{self.cf_proxy_url}/load/{file_id}"
@@ -199,8 +237,16 @@ class gdrive:
             drive_name = self.drive_names[obj['driveId']]
 
             m = meta(name)
-            out.append({'name': get_name(), 'title': get_title(), 'url': get_url()})
+            out.append(
+                {'name': get_name(), 'title': get_title(), 'url': get_url()})
+
+        noresult = [{
+            'name': '404', 
+            'title': 'No results found!', 
+            'externalUrl': '/'}]
 
         time_taken = (datetime.now() - start_time).total_seconds()
-        print(f'Fetched {len(out)} stream(s) in {time_taken:.3f}s for {self.query}')
-        return out
+        print(f'Fetched {len(out)} stream(s) in {time_taken:.3f}s',
+              f'for ({id}) {self.query}')
+
+        return out if len(out) else noresult
